@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+import json
+import os
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List
+import secrets
+import shlex
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_home() -> Path:
+    base = os.environ.get("BGSH_HOME")
+    if base:
+        return Path(base).expanduser()
+    return Path.home() / ".bgsh"
+
+
+BASE_DIR = get_home()
+LOG_DIR = BASE_DIR / "logs"
+SESSION_DIR = BASE_DIR / "sessions"
+SESSION_EXT = ".json"
+
+
+def ensure_dirs() -> None:
+    base_existed = BASE_DIR.exists()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    if not base_existed and BASE_DIR.exists():
+        ensure_gitignore_entry()
+
+
+def ensure_gitignore_entry() -> None:
+    if os.environ.get("BGSH_HOME"):
+        return
+
+    if BASE_DIR.name != ".bgsh":
+        return
+
+    workspace_root = BASE_DIR.parent
+    if not workspace_root.exists():
+        return
+
+    gitignore_path = workspace_root / ".gitignore"
+    entry = ".bgsh/\n"
+    try:
+        if gitignore_path.exists():
+            with gitignore_path.open("r+", encoding="utf-8") as fh:
+                contents = fh.read()
+                lines = [line.strip() for line in contents.splitlines()]
+                if ".bgsh/" in lines:
+                    return
+                if contents and not contents.endswith("\n"):
+                    fh.write("\n")
+                fh.write(entry)
+        else:
+            with gitignore_path.open("w", encoding="utf-8") as fh:
+                fh.write(entry)
+    except OSError:
+        pass
+
+
+def generate_session_id() -> str:
+    while True:
+        session_id = secrets.token_hex(2)  # 4 hex characters
+        if not (SESSION_DIR / f"{session_id}{SESSION_EXT}").exists():
+            return session_id
+
+
+def safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def meta_path(session_id: str) -> Path:
+    return SESSION_DIR / f"{session_id}{SESSION_EXT}"
+
+
+def log_path(session_id: str) -> Path:
+    return LOG_DIR / f"{session_id}.log"
+
+
+def load_metadata(session_id: str) -> Dict[str, Any]:
+    path = meta_path(session_id)
+    if not path.exists():
+        raise FileNotFoundError(f"bgsh: unknown session '{session_id}'")
+    with path.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_metadata(session_id: str, data: Dict[str, Any]) -> None:
+    path = meta_path(session_id)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+    tmp.replace(path)
+
+
+def list_session_ids() -> List[str]:
+    if not SESSION_DIR.exists():
+        return []
+    ids: List[str] = []
+    for entry in SESSION_DIR.iterdir():
+        if entry.is_file() and entry.suffix == SESSION_EXT:
+            ids.append(entry.stem)
+    ids.sort()
+    return ids
+
+
+def process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    else:
+        return True
+
+
+def cmd_run(command: List[str]) -> int:
+    if not command:
+        print("bgsh: run requires a command", file=sys.stderr)
+        return 1
+
+    ensure_dirs()
+    session_id = generate_session_id()
+    log_file = log_path(session_id)
+    meta_file = meta_path(session_id)
+    cwd = os.getcwd()
+    started_at = now_iso()
+    command_display = " ".join(shlex.quote(part) for part in command)
+
+    # Open log file before spawning process to ensure it exists even if command fails quickly.
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with log_file.open("wb") as log_handle:
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=cwd,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            print(f"bgsh: command not found: {command[0]}", file=sys.stderr)
+            safe_unlink(log_file)
+            return 127
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"bgsh: failed to start command: {exc}", file=sys.stderr)
+            safe_unlink(log_file)
+            return 1
+
+    metadata: Dict[str, Any] = {
+        "id": session_id,
+        "pid": proc.pid,
+        "argv": command,
+        "command": command_display,
+        "cwd": cwd,
+        "log": str(log_file),
+        "started_at": started_at,
+        "status": "running",
+    }
+    save_metadata(session_id, metadata)
+
+    # Update convenience symlinks
+    try:
+        meta_symlink = SESSION_DIR / "latest"
+        if meta_symlink.exists() or meta_symlink.is_symlink():
+            meta_symlink.unlink()
+        meta_symlink.symlink_to(meta_file.name)
+    except OSError:
+        pass
+
+    try:
+        log_symlink = LOG_DIR / "latest.log"
+        if log_symlink.exists() or log_symlink.is_symlink():
+            log_symlink.unlink()
+        log_symlink.symlink_to(log_file.name)
+    except OSError:
+        pass
+
+    print(f"{command_display} is running in the background with session-id {session_id}.")
+    print(f"Use `bgsh logs {session_id}` to read the logs.")
+    return 0
+
+
+def cmd_logs(session_id: str) -> int:
+    try:
+        metadata = load_metadata(session_id)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    log_file = Path(metadata.get("log", ""))
+    if not log_file.exists():
+        print(f"bgsh: log file missing for session '{session_id}'", file=sys.stderr)
+        return 1
+
+    try:
+        with log_file.open("rb") as fh:
+            while True:
+                chunk = fh.read(8192)
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"bgsh: failed to read log: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+def update_status(metadata: Dict[str, Any], new_status: str) -> None:
+    metadata["status"] = new_status
+    metadata["updated_at"] = now_iso()
+    save_metadata(metadata["id"], metadata)
+
+
+def cmd_kill(session_id: str) -> int:
+    try:
+        metadata = load_metadata(session_id)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    pid = metadata.get("pid")
+    if not isinstance(pid, int):
+        print(f"bgsh: invalid pid in session '{session_id}'", file=sys.stderr)
+        return 1
+
+    if not process_alive(pid):
+        if metadata.get("status") == "running":
+            update_status(metadata, "exited")
+        print(f"bgsh: session '{session_id}' not running", file=sys.stderr)
+        return 1
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"bgsh: failed to kill session '{session_id}': {exc}", file=sys.stderr)
+        return 1
+
+    metadata["stopped_at"] = now_iso()
+    update_status(metadata, "stopped")
+    print(f"killed {session_id}")
+    return 0
+
+
+def cmd_status() -> int:
+    ensure_dirs()
+    sessions = list_session_ids()
+    rows = []
+    for session_id in sessions:
+        try:
+            metadata = load_metadata(session_id)
+        except FileNotFoundError:
+            continue
+        pid = metadata.get("pid")
+        if not isinstance(pid, int):
+            continue
+        if process_alive(pid):
+            rows.append(
+                (
+                    session_id,
+                    str(pid),
+                    metadata.get("started_at", ""),
+                    metadata.get("command", ""),
+                )
+            )
+        else:
+            if metadata.get("status") == "running":
+                update_status(metadata, "exited")
+
+    if not rows:
+        print("No active bgsh sessions.")
+        return 0
+
+    header = ("SESSION", "PID", "STARTED (UTC)", "COMMAND")
+    widths = [len(part) for part in header]
+    for entry in rows:
+        for idx, value in enumerate(entry):
+            widths[idx] = max(widths[idx], len(value))
+
+    fmt = " ".join(f"{{:{w}}}" for w in widths)
+    print(fmt.format(*header))
+    for entry in rows:
+        print(fmt.format(*entry))
+    return 0
+
+
+def usage() -> None:
+    help_text = """bgsh - background shell
+
+Usage:
+  bgsh run <command>      Run the command in the background and print a session id.
+  bgsh status             List active bgsh sessions.
+  bgsh logs <session-id>  Print the full log for a session.
+  bgsh kill <session-id>  Terminate the background session.
+"""
+    print(help_text.strip())
+
+
+def main(argv: List[str]) -> int:
+    if not argv:
+        usage()
+        return 1
+
+    cmd = argv[0]
+    if cmd == "run":
+        return cmd_run(argv[1:])
+    if cmd == "logs":
+        if len(argv) < 2:
+            print("bgsh: logs requires a session id", file=sys.stderr)
+            return 1
+        return cmd_logs(argv[1])
+    if cmd == "kill":
+        if len(argv) < 2:
+            print("bgsh: kill requires a session id", file=sys.stderr)
+            return 1
+        return cmd_kill(argv[1])
+    if cmd in ("status", "--status"):
+        return cmd_status()
+    if cmd in ("-h", "--help"):
+        usage()
+        return 0
+
+    print(f"bgsh: unknown option '{cmd}'", file=sys.stderr)
+    usage()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

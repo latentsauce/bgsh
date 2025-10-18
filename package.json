@@ -1,0 +1,44 @@
+{
+  "name": "bgsh",
+  "version": "0.2.1",
+  "description": "background shell - run commands in the background with session management",
+  "main": "bgsh",
+  "bin": {
+    "bgsh": "./bgsh"
+  },
+  "scripts": {
+    "build": "mkdir -p dist && cp bgsh dist/bgsh && chmod +x dist/bgsh",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "bgsh",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "background",
+    "shell",
+    "process",
+    "daemon",
+    "session",
+    "cli",
+    "terminal"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "bugs": {
+    "url": ""
+  },
+  "homepage": "",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}

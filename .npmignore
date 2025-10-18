@@ -1,0 +1,41 @@
+# Development files
+.git
+.gitignore
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Test files
+test/
+tests/
+*.test.js
+*.spec.js
+
+# Build artifacts
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Editor files
+.vscode/
+.idea/
+*.sublime-*
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Misc
+.env
+.env.local
+coverage/
+.nyc_output/
