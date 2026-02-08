@@ -131,6 +131,11 @@ def cmd_run(command: List[str]) -> int:
         print("bgsh: run requires a command", file=sys.stderr)
         return 1
 
+    # If the entire command was passed as a single quoted string
+    # (e.g. bgsh run 'bun run dev'), split it into proper argv.
+    if len(command) == 1:
+        command = shlex.split(command[0])
+
     ensure_dirs()
     session_id = generate_session_id()
     log_file = log_path(session_id)
