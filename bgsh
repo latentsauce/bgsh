@@ -261,6 +261,39 @@ def cmd_kill(session_id: str) -> int:
     return 0
 
 
+def cmd_killall() -> int:
+    ensure_dirs()
+    sessions = list_session_ids()
+    killed = 0
+    for session_id in sessions:
+        try:
+            metadata = load_metadata(session_id)
+        except FileNotFoundError:
+            continue
+        pid = metadata.get("pid")
+        if not isinstance(pid, int):
+            continue
+        if not process_alive(pid):
+            if metadata.get("status") == "running":
+                update_status(metadata, "exited")
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:  # pylint: disable=broad-except
+            print(f"bgsh: failed to kill session '{session_id}'", file=sys.stderr)
+            continue
+        metadata["stopped_at"] = now_iso()
+        update_status(metadata, "stopped")
+        print(f"killed {session_id}")
+        killed += 1
+
+    if killed == 0:
+        print("No active bgsh sessions.")
+    else:
+        print(f"killed {killed} session{'s' if killed != 1 else ''}")
+    return 0
+
+
 def cmd_status() -> int:
     ensure_dirs()
     sessions = list_session_ids()
@@ -311,6 +344,7 @@ Usage:
   bgsh status             List active bgsh sessions.
   bgsh logs <session-id>  Print the full log for a session.
   bgsh kill <session-id>  Terminate the background session.
+  bgsh killall             Terminate all active sessions.
 """
     print(help_text.strip())
 
@@ -333,6 +367,8 @@ def main(argv: List[str]) -> int:
             print("bgsh: kill requires a session id", file=sys.stderr)
             return 1
         return cmd_kill(argv[1])
+    if cmd == "killall":
+        return cmd_killall()
     if cmd in ("status", "--status"):
         return cmd_status()
     if cmd in ("-h", "--help"):
